@@ -29,6 +29,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    FSInputFile,
 )
 
 # ==============================================================================
@@ -375,6 +376,23 @@ async def cmd_myid(message: Message) -> None:
         f"Sizning Telegram ID raqamingiz: <code>{message.from_user.id}</code>\n"
         f"Toshkent vaqti: <b>{now_tashkent_str()}</b>"
     )
+
+
+# --- BAZA BACKUP BUYRUG'I ---
+@router.message(Command("backup"))
+async def cmd_backup(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Sizda bu buyruqni ishlatish uchun huquq yo'q.")
+        return
+    
+    if os.path.exists(DB_PATH):
+        file_to_send = FSInputFile(DB_PATH)
+        await message.answer_document(
+            document=file_to_send,
+            caption=f"📁 <b>Skazka Bot Bazasi (Backup)</b>\n🕒 Vaqt: {now_tashkent_str()}"
+        )
+    else:
+        await message.answer("⚠️ Hozircha ma'lumotlar bazasi fayli topilmadi.")
 
 
 @router.message(CommandStart())
@@ -1154,7 +1172,6 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Render uchun kichik web-server va botni birga ishga tushiramiz
     await start_web_server()
 
     logging.info(f"Skazka Bot ishga tushdi! Toshkent vaqti: {now_tashkent_str()}")
