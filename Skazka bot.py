@@ -4,17 +4,6 @@
 SKAZKA — Pishiriqlar tarqatish (distribyutorlik) uchun maxsus Telegram Bot.
 Kutubxona: aiogram 3.x (pip install aiogram tzdata)
 Vaqt mintaqasi: Asia/Tashkent (UTC+5)
-
-Asosiy imkoniyatlar:
-1. Mijozlarni ro'yxatdan o'tkazish (Ism-familiya, Telefon raqam, Magazin manzili / lokatsiyasi).
-2. Admin panel orqali barcha mijozlarni ko'rish va har bir mijozga maxsus nom berish
-   (masalan: "Alisherov Alisher" -> "Yugnakiy Alisher").
-3. Admin panelda bitta tugmani bosish orqali barcha mijozlarga "Zakaz va foto-otchet tashlab yuboring"
-   xabarini yuborish (rassilka).
-4. Katalog boshqaruvi: Admin mahsulot rasmi va nomini kiritib katalog yaratadi va tahrirlaydi;
-   mijozlar istalgan vaqtda katalogni ko'ra oladi.
-5. Mijoz yuborgan har qanday rasm (foto-otchet / zakaz) va xabar to'g'ridan-to'g'ri adminga
-   mijozning admin qo'ygan nomi, telefoni, manzili va Toshkent vaqti bilan yetib boradi.
 """
 
 import asyncio
@@ -23,6 +12,7 @@ import os
 import sqlite3
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -45,11 +35,8 @@ from aiogram.types import (
 # 1. SOZLAMALAR (CONFIG) VA TOSHKENT VAQTI
 # ==============================================================================
 
-# BotFather'dan olingan tokenni shu yerga yoki BOT_TOKEN muhit o'zgaruvchisiga yozing:
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9175930111:AAHlb7yC45nsjQE0aGmvS65ZrSiiFfnhwz4")
 
-# Adminlarning Telegram ID raqamlari (o'zingizning Telegram ID raqamingizni kiriting):
-# Telegram ID ni bilish uchun botga /myid buyrug'ini yuborishingiz mumkin.
 ADMIN_IDS = [
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "6766950408").split(",")
@@ -61,12 +48,10 @@ TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
 
 
 def now_tashkent_str() -> str:
-    """Joriy Toshkent vaqtini 'KK.OO.YYYY SS:DD:SS' formatida qaytaradi."""
     return datetime.now(TASHKENT_TZ).strftime("%d.%m.%Y %H:%M:%S")
 
 
 def is_admin(user_id: int) -> bool:
-    """Foydalanuvchi admin ekanligini tekshiradi."""
     return user_id in ADMIN_IDS
 
 
@@ -76,10 +61,8 @@ def is_admin(user_id: int) -> bool:
 
 
 def init_db() -> None:
-    """SQLite bazasini va jadvallarni yaratadi."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        # Mijozlar jadvali
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS clients (
@@ -95,7 +78,6 @@ def init_db() -> None:
             )
             """
         )
-        # Katalog (mahsulotlar) jadvali
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS catalog (
@@ -106,7 +88,6 @@ def init_db() -> None:
             )
             """
         )
-        # Yuborilgan foto-otchet / zakazlar tarixi
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS orders_log (
@@ -122,7 +103,6 @@ def init_db() -> None:
 
 
 def get_client(user_id: int) -> dict | None:
-    """Mijoz ma'lumotlarini user_id bo'yicha olish."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -140,7 +120,6 @@ def save_client(
     latitude: float | None = None,
     longitude: float | None = None,
 ) -> None:
-    """Yangi mijozni ro'yxatdan o'tkazish yoki ma'lumotini yangilash."""
     existing = get_client(user_id)
     custom_name = existing["custom_name"] if existing else None
     registered_at = existing["registered_at"] if existing else now_tashkent_str()
@@ -168,7 +147,6 @@ def save_client(
 
 
 def update_client_custom_name(user_id: int, custom_name: str) -> bool:
-    """Admin tomonidan mijozga maxsus nom (masalan: 'Yugnakiy Alisher') berish."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
             "UPDATE clients SET custom_name = ? WHERE user_id = ?",
@@ -179,7 +157,6 @@ def update_client_custom_name(user_id: int, custom_name: str) -> bool:
 
 
 def get_all_clients() -> list[dict]:
-    """Barcha ro'yxatdan o'tgan mijozlar ro'yxatini qaytaradi."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -189,7 +166,6 @@ def get_all_clients() -> list[dict]:
 
 
 def add_catalog_item(name: str, photo_file_id: str) -> int:
-    """Katalogga yangi pishiriq / mahsulot qo'shish."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
             "INSERT INTO catalog (name, photo_file_id, created_at) VALUES (?, ?, ?)",
@@ -200,7 +176,6 @@ def add_catalog_item(name: str, photo_file_id: str) -> int:
 
 
 def get_catalog_items() -> list[dict]:
-    """Katalogdagi barcha mahsulotlarni olish."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM catalog ORDER BY id ASC").fetchall()
@@ -208,7 +183,6 @@ def get_catalog_items() -> list[dict]:
 
 
 def delete_catalog_item(item_id: int) -> bool:
-    """Katalogdan mahsulotni o'chirish."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute("DELETE FROM catalog WHERE id = ?", (item_id,))
         conn.commit()
@@ -216,7 +190,6 @@ def delete_catalog_item(item_id: int) -> bool:
 
 
 def log_order(client_id: int, photo_file_id: str | None, caption: str | None) -> None:
-    """Mijoz yuborgan zakaz / foto-otchetni bazada qayd etish."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO orders_log (client_id, photo_file_id, caption, created_at) VALUES (?, ?, ?, ?)",
@@ -226,7 +199,6 @@ def log_order(client_id: int, photo_file_id: str | None, caption: str | None) ->
 
 
 def format_client_display_name(client: dict) -> str:
-    """Mijozning admin qo'ygan nomini yoki asl ism-familiyasini ko'rsatadi."""
     if client.get("custom_name"):
         return f"{client['custom_name']} ({client['full_name']})"
     return client["full_name"]
@@ -260,7 +232,6 @@ class AdminStates(StatesGroup):
 
 
 def client_main_kb(user_id: int) -> ReplyKeyboardMarkup:
-    """Mijozning asosiy menyusi (agar admin bo'lsa, Admin panel tugmasi ham chiqadi)."""
     buttons = [
         [KeyboardButton(text="📸 Zakaz / Foto-otchet yuborish")],
         [
@@ -274,7 +245,6 @@ def client_main_kb(user_id: int) -> ReplyKeyboardMarkup:
 
 
 def admin_main_kb() -> ReplyKeyboardMarkup:
-    """Admin panelining asosiy tugmalari."""
     buttons = [
         [KeyboardButton(text="📢 Zakaz / Foto-otchet so'rash (Hammaga)")],
         [
@@ -291,7 +261,6 @@ def admin_main_kb() -> ReplyKeyboardMarkup:
 
 
 def cancel_kb() -> ReplyKeyboardMarkup:
-    """Amalni bekor qilish tugmasi."""
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
         resize_keyboard=True,
@@ -299,7 +268,6 @@ def cancel_kb() -> ReplyKeyboardMarkup:
 
 
 def phone_request_kb() -> ReplyKeyboardMarkup:
-    """Telefon raqamni yuborish tugmasi."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📱 Telefon raqamni yuborish", request_contact=True)]
@@ -310,7 +278,6 @@ def phone_request_kb() -> ReplyKeyboardMarkup:
 
 
 def location_request_kb() -> ReplyKeyboardMarkup:
-    """Lokatsiya yuborish yoki matn yozish uchun klaviatura."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📍 Lokatsiya yuborish", request_location=True)]
@@ -321,7 +288,6 @@ def location_request_kb() -> ReplyKeyboardMarkup:
 
 
 def build_clients_inline_kb(clients: list[dict]) -> InlineKeyboardMarkup:
-    """Admin uchun mijozlar ro'yxati inline tugmalari."""
     rows = []
     for c in clients:
         label = c["custom_name"] if c.get("custom_name") else c["full_name"]
@@ -337,7 +303,6 @@ def build_clients_inline_kb(clients: list[dict]) -> InlineKeyboardMarkup:
 
 
 def client_detail_inline_kb(client_id: int) -> InlineKeyboardMarkup:
-    """Admin mijoz profilini ochganda chiqadigan tugmalar."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -363,7 +328,6 @@ def client_detail_inline_kb(client_id: int) -> InlineKeyboardMarkup:
 
 
 def order_admin_actions_kb(client_id: int) -> InlineKeyboardMarkup:
-    """Adminga foto-otchet kelganda rasm tagida chiqadigan tezkor tugmalar."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -389,7 +353,6 @@ def order_admin_actions_kb(client_id: int) -> InlineKeyboardMarkup:
 router = Router()
 
 
-# --- Har qanday holatdan "❌ Bekor qilish" tugmasi ---
 @router.message(F.text == "❌ Bekor qilish")
 async def cancel_action_handler(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -406,7 +369,6 @@ async def cancel_action_handler(message: Message, state: FSMContext) -> None:
         )
 
 
-# --- Telegram ID ni bilish uchun yordamchi buyruq ---
 @router.message(Command("myid"))
 async def cmd_myid(message: Message) -> None:
     await message.answer(
@@ -415,7 +377,6 @@ async def cmd_myid(message: Message) -> None:
     )
 
 
-# --- /start va Ro'yxatdan o'tish jarayoni ---
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
@@ -434,7 +395,6 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         )
         return
 
-    # Agar yangi foydalanuvchi admin bo'lsa ham, xohlasa ro'yxatdan o'tadi yoki /admin ga kiradi
     welcome_text = (
         "Assalomu alaykum! 🥐 <b>Skazka</b> rasmiy botiga xush kelibsiz!\n\n"
         "Botdan foydalanish va zakaz berish uchun qisqa ro'yxatdan o'ting.\n"
@@ -528,7 +488,6 @@ async def reg_address(message: Message, state: FSMContext, bot: Bot) -> None:
         reply_markup=client_main_kb(user.id),
     )
 
-    # Adminlarga yangi mijoz haqida xabar berish va darhol nom berish imkonini taqdim etish
     client_record = get_client(user.id)
     admin_notify_text = (
         "🆕 <b>Yangi mijoz ro'yxatdan o'tdi!</b>\n\n"
@@ -553,11 +512,6 @@ async def reg_address(message: Message, state: FSMContext, bot: Bot) -> None:
                 )
         except Exception as e:
             logging.warning(f"Adminga ({admin_id}) xabar yuborishda xatolik: {e}")
-
-
-# ==============================================================================
-# 6. MIJOZ MENYUSI VA KATALOG KO'RISH
-# ==============================================================================
 
 
 @router.message(F.text == "👤 Mening ma'lumotlarim")
@@ -624,11 +578,6 @@ async def prompt_for_order_photo(message: Message, state: FSMContext) -> None:
     )
 
 
-# ==============================================================================
-# 7. ADMIN PANEL VA BOSHQARUV
-# ==============================================================================
-
-
 @router.message(Command("admin"))
 @router.message(F.text == "🔐 Admin Panel")
 async def open_admin_panel(message: Message, state: FSMContext) -> None:
@@ -658,7 +607,6 @@ async def back_to_client_menu(message: Message, state: FSMContext) -> None:
     )
 
 
-# --- 7.1. Mijozlar ro'yxatini ko'rish va ularga maxsus nom berish ---
 @router.message(F.text == "👥 Mijozlar ro'yxati")
 async def admin_list_clients(message: Message) -> None:
     if not is_admin(message.from_user.id):
@@ -778,7 +726,6 @@ async def admin_save_client_new_name(message: Message, state: FSMContext) -> Non
     )
 
 
-# --- 7.2. Bitta tugma orqali HAMMA mijozlarga "Zakaz / Foto-otchet tashlab yuboring" xabarini jo'natish ---
 @router.message(F.text == "📢 Zakaz / Foto-otchet so'rash (Hammaga)")
 async def admin_broadcast_order_request_prompt(message: Message) -> None:
     if not is_admin(message.from_user.id):
@@ -856,7 +803,7 @@ async def cb_broadcast_foto_otchet_now(callback: CallbackQuery, bot: Bot) -> Non
                 reply_markup=client_main_kb(c["user_id"]),
             )
             sent_count += 1
-            await asyncio.sleep(0.05)  # Telegram flood limitdan himoya
+            await asyncio.sleep(0.05)
         except Exception as e:
             failed_count += 1
             logging.warning(f"Mijozga ({c['user_id']}) xabar bormadi: {e}")
@@ -870,7 +817,6 @@ async def cb_broadcast_foto_otchet_now(callback: CallbackQuery, bot: Bot) -> Non
     await callback.answer("Hammaga yuborildi!")
 
 
-# --- Bitta mijozning o'ziga eslatma yuborish ---
 @router.callback_query(F.data.startswith("client_remind:"))
 async def cb_single_client_remind(callback: CallbackQuery, bot: Bot) -> None:
     if not is_admin(callback.from_user.id):
@@ -899,7 +845,6 @@ async def cb_single_client_remind(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer(f"Xatolik: {e}", show_alert=True)
 
 
-# --- 7.3. Maxsus (ixtiyoriy matnli) xabar yuborish ---
 @router.message(F.text == "✍️ Maxsus xabar yuborish")
 async def admin_custom_broadcast_start(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
@@ -941,7 +886,6 @@ async def admin_custom_broadcast_send(
     )
 
 
-# --- 7.4. Katalog boshqaruvi (Mahsulot rasmi + nomini qo'shish va o'chirish) ---
 @router.message(F.text == "➕ Katalogga mahsulot qo'shish")
 async def admin_add_catalog_start(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
@@ -959,7 +903,6 @@ async def admin_add_catalog_photo(message: Message, state: FSMContext) -> None:
     photo_file_id = message.photo[-1].file_id
     await state.update_data(catalog_photo_id=photo_file_id)
 
-    # Agar admin rasm bilan birga caption (izoh) ham yozib yuborgan bo'lsa, darhol saqlaymiz
     if message.caption and message.caption.strip():
         prod_name = message.caption.strip()
         add_catalog_item(prod_name, photo_file_id)
@@ -1041,19 +984,10 @@ async def cb_catalog_delete(callback: CallbackQuery) -> None:
     await callback.answer("🗑 Mahsulot katalogdan o'chirildi!", show_alert=True)
 
 
-# ==============================================================================
-# 8. MIJOZDAN KELGAN RASM (FOTO-OTCHET / ZAKAZ) VA XABARLARNI ADMINGA YETKAZISH
-# ==============================================================================
-
-
 @router.message(F.photo)
 async def handle_client_photo_order(
     message: Message, state: FSMContext, bot: Bot
 ) -> None:
-    """
-    Mijoz botga rasm yuborganda (zakaz / foto-otchet), rasm to'g'ridan-to'g'ri
-    barcha adminlarga mijozning admin qo'ygan nomi, telefoni, manzili va Toshkent vaqti bilan boradi.
-    """
     user_id = message.from_user.id
     client = get_client(user_id)
     if not client:
@@ -1140,7 +1074,6 @@ async def cb_order_confirm_to_client(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer(f"Xatolik: {e}", show_alert=True)
 
 
-# Agar mijoz matn ko'rinishida zakaz yozsa ham adminga yetkazish:
 @router.message(F.text)
 async def handle_client_text_order(
     message: Message, state: FSMContext, bot: Bot
@@ -1183,8 +1116,21 @@ async def handle_client_text_order(
 
 
 # ==============================================================================
-# 9. BOTNI ISHGA TUSHIRISH (MAIN)
+# 9. RENDER WEB SERVER VA BOTNI ISHGA TUSHIRISH (MAIN)
 # ==============================================================================
+
+async def handle_ping(request):
+    return web.Response(text="Skazka Bot is running!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logging.info(f"Web server started on port {port}")
 
 
 async def main() -> None:
@@ -1207,6 +1153,9 @@ async def main() -> None:
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    # Render uchun kichik web-server va botni birga ishga tushiramiz
+    await start_web_server()
 
     logging.info(f"Skazka Bot ishga tushdi! Toshkent vaqti: {now_tashkent_str()}")
     await dp.start_polling(bot)
