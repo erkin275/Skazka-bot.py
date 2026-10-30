@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SKAZKA — Pishiriqlar tarqatish (distribyutorlik) uchun maxsus Telegram Bot.
+#SKAZKA — Pishiriqlar tarqatish (distribyutorlik) uchun maxsus Telegram Bot.
 Kutubxona: aiogram 3.x (pip install aiogram tzdata)
 Vaqt mintaqasi: Asia/Tashkent (UTC+5)
 """
