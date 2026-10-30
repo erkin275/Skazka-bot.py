@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 #SKAZKA — Pishiriqlar tarqatish (distribyutorlik) uchun maxsus Telegram Bot.
-Kutubxona: aiogram 3.x (pip install aiogram tzdata)
+Kutubxona: aiogram 3.x (pip install aiogram tzdata aiohttp)
 Vaqt mintaqasi: Asia/Tashkent (UTC+5)
 """
 
@@ -30,7 +30,9 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     FSInputFile,
+    Update,
 )
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ==============================================================================
 # 1. SOZLAMALAR (CONFIG) VA TOSHKENT VAQTI
@@ -46,6 +48,14 @@ ADMIN_IDS = [
 
 DB_PATH = os.getenv("SKAZKA_DB_PATH", "skazka_bot.db")
 TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
+
+# Render uchun webhook sozlamalari
+# RENDER_EXTERNAL_URL — Render sizga beradigan doimiy sayt linki (masalan: https://skazka-bot.onrender.com)
+WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "")
+WEBHOOK_PATH = f"/bot/{BOT_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+PORT = int(os.environ.get("PORT", 10000))
 
 
 def now_tashkent_str() -> str:
@@ -378,7 +388,6 @@ async def cmd_myid(message: Message) -> None:
     )
 
 
-# --- BAZA BACKUP BUYRUG'I ---
 @router.message(Command("backup"))
 async def cmd_backup(message: Message) -> None:
     if not is_admin(message.from_user.id):
@@ -1134,21 +1143,13 @@ async def handle_client_text_order(
 
 
 # ==============================================================================
-# 9. RENDER WEB SERVER VA BOTNI ISHGA TUSHIRISH (MAIN)
+# 6. WEBHOOK VA ASOSIY ISHGA TUSHIRISH (MAIN)
 # ==============================================================================
 
-async def handle_ping(request):
-    return web.Response(text="Skazka Bot is running!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    logging.info(f"Web server started on port {port}")
+async def on_startup(bot: Bot) -> None:
+    # Webhookni Telegram serveriga ulash
+    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+    logging.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
 
 
 async def main() -> None:
@@ -1160,8 +1161,7 @@ async def main() -> None:
 
     if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
         logging.error(
-            "DIQQAT! BOT_TOKEN kiritilmagan. Fayl ichidagi BOT_TOKEN o'zgaruvchisiga "
-            "BotFather'dan olgan tokeningizni yozing va ADMIN_IDS ga Telegram ID raqamingizni kiriting."
+            "DIQQAT! BOT_TOKEN kiritilmagan."
         )
         return
 
@@ -1172,10 +1172,32 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    await start_web_server()
+    # Startup hodisasini ulash
+    dp.startup.register(on_startup)
 
-    logging.info(f"Skazka Bot ishga tushdi! Toshkent vaqti: {now_tashkent_str()}")
-    await dp.start_polling(bot)
+    # aiohttp ilovasini yaratish
+    app = web.Application()
+    
+    # Webhook so'rovlarini qabul qiluvchi handler
+    webhook_requests_handler = SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+    )
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+
+    # Ilovani sozlash
+    setup_application(app, dp, bot=bot)
+
+    # Serverni ishga tushirish
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    
+    logging.info(f"Skazka Webhook Bot port {PORT} da ishga tushdi! Toshkent vaqti: {now_tashkent_str()}")
+
+    # Server to'xtab qolmasligi uchun cheksiz kutish
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
