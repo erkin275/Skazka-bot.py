@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-#SKAZKA — Pishiriqlar tarqatish (distribyutorlik) uchun maxsus Telegram Bot.
+SKAZKA — Pishiriqlar tarqatish (distribyutorlik) uchun maxsus Telegram Bot.
 Kutubxona: aiogram 3.x (pip install aiogram tzdata aiohttp)
 Vaqt mintaqasi: Asia/Tashkent (UTC+5)
 """
@@ -30,7 +30,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     FSInputFile,
-    Update,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -50,7 +49,6 @@ DB_PATH = os.getenv("SKAZKA_DB_PATH", "skazka_bot.db")
 TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
 
 # Render uchun webhook sozlamalari
-# RENDER_EXTERNAL_URL — Render sizga beradigan doimiy sayt linki (masalan: https://skazka-bot.onrender.com)
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_URL", "")
 WEBHOOK_PATH = f"/bot/{BOT_TOKEN}"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
@@ -106,6 +104,19 @@ def init_db() -> None:
                 client_id INTEGER NOT NULL,
                 photo_file_id TEXT,
                 caption TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS catalog_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER NOT NULL,
+                item_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
                 created_at TEXT NOT NULL
             )
             """
@@ -167,6 +178,13 @@ def update_client_custom_name(user_id: int, custom_name: str) -> bool:
         return cursor.rowcount > 0
 
 
+def delete_client(user_id: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("DELETE FROM clients WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def get_all_clients() -> list[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -193,6 +211,23 @@ def get_catalog_items() -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_catalog_item(item_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM catalog WHERE id = ?", (item_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def update_catalog_item_name(item_id: int, new_name: str) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            "UPDATE catalog SET name = ? WHERE id = ?",
+            (new_name.strip(), item_id),
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+
 def delete_catalog_item(item_id: int) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute("DELETE FROM catalog WHERE id = ?", (item_id,))
@@ -205,6 +240,37 @@ def log_order(client_id: int, photo_file_id: str | None, caption: str | None) ->
         conn.execute(
             "INSERT INTO orders_log (client_id, photo_file_id, caption, created_at) VALUES (?, ?, ?, ?)",
             (client_id, photo_file_id, caption, now_tashkent_str()),
+        )
+        conn.commit()
+
+
+def create_catalog_order(client_id: int, item_id: int, item_name: str, quantity: str) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO catalog_orders (client_id, item_id, item_name, quantity, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (client_id, item_id, item_name, quantity.strip(), now_tashkent_str()),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_catalog_order(order_id: int) -> dict | None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM catalog_orders WHERE id = ?", (order_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def update_catalog_order_status(order_id: int, status: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE catalog_orders SET status = ? WHERE id = ?",
+            (status, order_id),
         )
         conn.commit()
 
@@ -228,12 +294,14 @@ class RegistrationStates(StatesGroup):
 
 class ClientOrderStates(StatesGroup):
     waiting_for_order_photo = State()
+    waiting_for_catalog_quantity = State()
 
 
 class AdminStates(StatesGroup):
     waiting_for_new_client_name = State()
     waiting_for_catalog_photo = State()
     waiting_for_catalog_name = State()
+    waiting_for_catalog_rename = State()
     waiting_for_custom_broadcast = State()
 
 
@@ -330,6 +398,12 @@ def client_detail_inline_kb(client_id: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="🗑 Mijozni bazadan o'chirish",
+                    callback_data=f"client_delete_ask:{client_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="⬅️ Mijozlar ro'yxatiga qaytish",
                     callback_data="clients_list_back",
                 )
@@ -357,6 +431,31 @@ def order_admin_actions_kb(client_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def catalog_order_admin_kb(order_id: int, client_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Tasdiqlash (Yetkazib beramiz)",
+                    callback_data=f"cat_ord_ok:{order_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Skladda qolmagan (Rad etish)",
+                    callback_data=f"cat_ord_no:{order_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Mijoz nomini o'zgartirish",
+                    callback_data=f"client_rename:{client_id}",
+                )
+            ],
+        ]
+    )
+
+
 # ==============================================================================
 # 5. ROUTER VA HANDLERLAR
 # ==============================================================================
@@ -370,12 +469,12 @@ async def cancel_action_handler(message: Message, state: FSMContext) -> None:
     user_id = message.from_user.id
     if is_admin(user_id):
         await message.answer(
-            "Amal bekor qilindi.",
+            "❌ Amal bekor qilindi.",
             reply_markup=admin_main_kb(),
         )
     else:
         await message.answer(
-            "Amal bekor qilindi.",
+            "❌ Amal bekor qilindi.",
             reply_markup=client_main_kb(user_id),
         )
 
@@ -393,12 +492,12 @@ async def cmd_backup(message: Message) -> None:
     if not is_admin(message.from_user.id):
         await message.answer("⛔ Sizda bu buyruqni ishlatish uchun huquq yo'q.")
         return
-    
+
     if os.path.exists(DB_PATH):
         file_to_send = FSInputFile(DB_PATH)
         await message.answer_document(
             document=file_to_send,
-            caption=f"📁 <b>Skazka Bot Bazasi (Backup)</b>\n🕒 Vaqt: {now_tashkent_str()}"
+            caption=f"📁 <b>Skazka Bot Bazasi (Backup)</b>\n🕒 Vaqt: {now_tashkent_str()}",
         )
     else:
         await message.answer("⚠️ Hozircha ma'lumotlar bazasi fayli topilmadi.")
@@ -415,9 +514,8 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await message.answer(
             f"Assalomu alaykum, <b>{display_name}</b>!\n"
             f"🥐 <b>Skazka</b> pishiriqlar botiga xush kelibsiz.\n\n"
-            f"Zakaz berish uchun <b>«📸 Zakaz / Foto-otchet yuborish»</b> tugmasini bosing "
-            f"yoki shunchaki rasm yuboring.\n"
-            f"Mahsulotlarimizni ko'rish uchun <b>«📖 Katalog (Mahsulotlar)»</b> bo'limiga o'ting.",
+            f"• Katalogdan pishiriq tanlab zakaz berish uchun <b>«📖 Katalog (Mahsulotlar)»</b> tugmasini bosing.\n"
+            f"• Foto-otchet yuborish uchun esa <b>«📸 Zakaz / Foto-otchet yuborish»</b> tugmasini bosing.",
             reply_markup=client_main_kb(user_id),
         )
         return
@@ -510,8 +608,8 @@ async def reg_address(message: Message, state: FSMContext, bot: Bot) -> None:
         f"📞 <b>Telefon:</b> {phone}\n"
         f"🏪 <b>Manzil:</b> {address}\n"
         f"🕒 <b>Vaqt:</b> {now_tashkent_str()}\n\n"
-        "Endi istalgan vaqtda <b>«📸 Zakaz / Foto-otchet yuborish»</b> tugmasi orqali "
-        "yoki botga to'g'ridan-to'g'ri rasm tashlab zakaz berishingiz mumkin!",
+        "Endi <b>«📖 Katalog (Mahsulotlar)»</b> bo'limidan pishiriqlarni tanlab zakaz berishingiz "
+        "yoki <b>«📸 Zakaz / Foto-otchet yuborish»</b> tugmasi orqali rasm yuborishingiz mumkin!",
         reply_markup=client_main_kb(user.id),
     )
 
@@ -569,8 +667,18 @@ async def cmd_re_register(message: Message, state: FSMContext) -> None:
     )
 
 
+# ==============================================================================
+# 6. KATALOG VA KATALOGDAN ZAKAZ QILISH (MIJOZ UCHUN)
+# ==============================================================================
+
+
 @router.message(F.text == "📖 Katalog (Mahsulotlar)")
-async def client_view_catalog(message: Message) -> None:
+async def client_view_catalog(message: Message, state: FSMContext) -> None:
+    client = get_client(message.from_user.id)
+    if not client and not is_admin(message.from_user.id):
+        await cmd_start(message, state)
+        return
+
     items = get_catalog_items()
     if not items:
         await message.answer(
@@ -579,13 +687,214 @@ async def client_view_catalog(message: Message) -> None:
         return
 
     await message.answer(
-        f"🥐 <b>Skazka pishiriqlar katalogi ({len(items)} ta mahsulot):</b>"
+        f"🥐 <b>Skazka pishiriqlar katalogi ({len(items)} ta mahsulot):</b>\n"
+        "Zakaz berish uchun xohlagan mahsulotingiz tagidagi <b>«🛒 Zakaz qilish»</b> tugmasini bosing:"
     )
     for idx, item in enumerate(items, start=1):
+        order_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"🛒 Zakaz qilish ({item['name'][:25]})",
+                        callback_data=f"cat_buy:{item['id']}",
+                    )
+                ]
+            ]
+        )
         await message.answer_photo(
             photo=item["photo_file_id"],
             caption=f"🥐 <b>{idx}. {item['name']}</b>",
+            reply_markup=order_kb,
         )
+
+
+@router.callback_query(F.data.startswith("cat_buy:"))
+async def cb_client_buy_from_catalog(callback: CallbackQuery, state: FSMContext) -> None:
+    user_id = callback.from_user.id
+    client = get_client(user_id)
+    if not client:
+        await callback.answer("Avval ro'yxatdan o'ting!", show_alert=True)
+        await cmd_start(callback.message, state)
+        return
+
+    item_id = int(callback.data.split(":")[1])
+    item = get_catalog_item(item_id)
+    if not item:
+        await callback.answer("⚠️ Bu mahsulot katalogdan o'chirilgan!", show_alert=True)
+        return
+
+    await state.set_state(ClientOrderStates.waiting_for_catalog_quantity)
+    await state.update_data(
+        order_item_id=item["id"],
+        order_item_name=item["name"],
+        order_item_photo=item["photo_file_id"],
+    )
+
+    await callback.message.answer(
+        f"🥐 Tanlangan mahsulot: <b>{item['name']}</b>\n\n"
+        "🔢 <b>Nechta zakaz qilmoqchisiz?</b>\n"
+        "<i>(Miqdorini yozib yuboring, masalan: 2 ta, 5 karobka, 3 kg va hokazo)</i>",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(ClientOrderStates.waiting_for_catalog_quantity, F.text)
+async def client_send_catalog_quantity(
+    message: Message, state: FSMContext, bot: Bot
+) -> None:
+    user_id = message.from_user.id
+    client = get_client(user_id)
+    if not client:
+        await state.clear()
+        await cmd_start(message, state)
+        return
+
+    quantity = message.text.strip()
+    data = await state.get_data()
+    item_id = data["order_item_id"]
+    item_name = data["order_item_name"]
+    item_photo = data["order_item_photo"]
+
+    await state.clear()
+
+    order_id = create_catalog_order(user_id, item_id, item_name, quantity)
+    tashkent_time = now_tashkent_str()
+
+    custom_title = (
+        f"🏷 <b>Mijoz (Admin nomi):</b> <b>{client['custom_name']}</b>\n"
+        if client.get("custom_name")
+        else "🏷 <b>Mijoz (Admin nomi):</b> <i>(Hali nom berilmagan)</i>\n"
+    )
+    map_link = ""
+    if client.get("latitude") and client.get("longitude"):
+        map_link = (
+            f" (<a href='https://maps.google.com/?q={client['latitude']},{client['longitude']}'>"
+            "Xarita</a>)"
+        )
+
+    admin_text = (
+        f"🛒 <b>KATALOGDAN YANGI ZAKAZ! (#{order_id})</b>\n\n"
+        f"{custom_title}"
+        f"👤 <b>Asl F.I.Sh:</b> {client['full_name']}\n"
+        f"📞 <b>Telefon:</b> {client['phone']}\n"
+        f"🏪 <b>Magazin manzili:</b> {client['address']}{map_link}\n"
+        f"🕒 <b>Vaqt:</b> {tashkent_time}\n\n"
+        f"🥐 <b>Pishiriq nomi:</b> <b>{item_name}</b>\n"
+        f"🔢 <b>Zakaz miqdori:</b> <b>{quantity}</b>\n\n"
+        "👇 <i>Ushbu zakazni tasdiqlaysizmi yoki skladda qolmaganmi?</i>"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_photo(
+                chat_id=admin_id,
+                photo=item_photo,
+                caption=admin_text,
+                reply_markup=catalog_order_admin_kb(order_id, user_id),
+            )
+        except Exception as e:
+            logging.warning(f"Adminga ({admin_id}) katalog zakazini yuborishda xatolik: {e}")
+
+    await message.answer(
+        f"✅ <b>Zakazingiz adminga yuborildi!</b>\n\n"
+        f"🥐 <b>Mahsulot:</b> {item_name}\n"
+        f"🔢 <b>Miqdori:</b> {quantity}\n"
+        f"🕒 <b>Vaqt:</b> {tashkent_time}\n\n"
+        "⏳ <i>Admin zakazni ko'rib chiqib, hozir sizga tasdiqlash xabarini yuboradi!</i>",
+        reply_markup=client_main_kb(user_id),
+    )
+
+
+# --- ADMIN KATALOG ZAKAZINI TASDIQLASHI YOKI RAD ETISHI ---
+@router.callback_query(F.data.startswith("cat_ord_ok:"))
+async def cb_catalog_order_approve(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+
+    order_id = int(callback.data.split(":")[1])
+    order = get_catalog_order(order_id)
+    if not order:
+        await callback.answer("Zakaz topilmadi!", show_alert=True)
+        return
+
+    update_catalog_order_status(order_id, "approved")
+    client = get_client(order["client_id"])
+    client_name = format_client_display_name(client) if client else str(order["client_id"])
+
+    try:
+        await bot.send_message(
+            chat_id=order["client_id"],
+            text=(
+                "🥐 <b>Skazka — Zakazingiz tasdiqlandi!</b> ✅\n\n"
+                f"📦 <b>Mahsulot:</b> {order['item_name']}\n"
+                f"🔢 <b>Miqdori:</b> {order['quantity']}\n"
+                f"🕒 <b>Tasdiqlangan vaqt:</b> {now_tashkent_str()}\n\n"
+                "🚚 <i>Zakazingiz ro'yxatga qo'shildi, tez orada yetkazib beramiz. Xaridingiz uchun rahmat!</i>"
+            ),
+            reply_markup=client_main_kb(order["client_id"]),
+        )
+    except Exception as e:
+        await callback.answer(f"Mijozga xabar bormadi: {e}", show_alert=True)
+        return
+
+    old_caption = callback.message.caption or ""
+    new_caption = (
+        old_caption.split("👇")[0].strip()
+        + f"\n\n✅ <b>TASDIQLANDI (Yetkazib beriladi)</b> — {now_tashkent_str()}"
+    )
+    await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+    await callback.answer(f"✅ {client_name} zakazi tasdiqlandi!", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("cat_ord_no:"))
+async def cb_catalog_order_reject(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+
+    order_id = int(callback.data.split(":")[1])
+    order = get_catalog_order(order_id)
+    if not order:
+        await callback.answer("Zakaz topilmadi!", show_alert=True)
+        return
+
+    update_catalog_order_status(order_id, "rejected")
+    client = get_client(order["client_id"])
+    client_name = format_client_display_name(client) if client else str(order["client_id"])
+
+    try:
+        await bot.send_message(
+            chat_id=order["client_id"],
+            text=(
+                "🥐 <b>Skazka — Zakaz bo'yicha ma'lumot:</b>\n\n"
+                f"📦 <b>Mahsulot:</b> {order['item_name']}\n"
+                f"🔢 <b>So'ralgan miqdor:</b> {order['quantity']}\n\n"
+                "❌ <b>Afsuski, hozirda bu mahsulotimiz skladimizda qolmabdi.</b>\n"
+                "📖 <i>Iltimos, katalogimizdan boshqa pishiriqlarimizni ko'rib chiqing!</i>"
+            ),
+            reply_markup=client_main_kb(order["client_id"]),
+        )
+    except Exception as e:
+        await callback.answer(f"Mijozga xabar bormadi: {e}", show_alert=True)
+        return
+
+    old_caption = callback.message.caption or ""
+    new_caption = (
+        old_caption.split("👇")[0].strip()
+        + f"\n\n❌ <b>RAD ETILDI (Skladda qolmagan)</b> — {now_tashkent_str()}"
+    )
+    await callback.message.edit_caption(caption=new_caption, reply_markup=None)
+    await callback.answer(
+        f"❌ {client_name} ga skladda qolmagani haqida xabar yuborildi!",
+        show_alert=True,
+    )
+
+
+# ==============================================================================
+# 7. ADMIN PANEL VA MIJOZLARNI BOSHQARISH (O'CHIRISH BILAN)
+# ==============================================================================
 
 
 @router.message(F.text == "📸 Zakaz / Foto-otchet yuborish")
@@ -600,7 +909,7 @@ async def prompt_for_order_photo(message: Message, state: FSMContext) -> None:
         "📸 <b>Marhamat, zakaz yoki vitrina foto-otchet rasmini yuboring!</b>\n\n"
         "• Rasm ostiga (izohga) kerakli pishiriqlar soni yoki qo'shimcha zakazingizni yozishingiz mumkin.\n"
         "• Yuborgan rasmingiz darhol <b>Skazka</b> adminiga yetib boradi.\n"
-        "• Agar pishiriqlarimiz turlarini ko'rmoqchi bo'lsangiz, <b>«📖 Katalog (Mahsulotlar)»</b> tugmasini bosing.",
+        "• Agar pishiriqlarimizni katalogdan tanlab zakaz qilmoqchi bo'lsangiz, <b>«📖 Katalog (Mahsulotlar)»</b> tugmasini bosing.",
         reply_markup=client_main_kb(message.from_user.id),
     )
 
@@ -646,8 +955,7 @@ async def admin_list_clients(message: Message) -> None:
 
     await message.answer(
         f"👥 <b>Barcha mijozlar ro'yxati ({len(clients)} ta):</b>\n"
-        "Mijozning to'liq ma'lumotini ko'rish yoki unga <b>maxsus nom berish</b> "
-        "(masalan: <i>Yugnakiy Alisher</i>) uchun ustiga bosing:",
+        "Mijozning to'liq ma'lumotini ko'rish, unga <b>maxsus nom berish</b> yoki <b>o'chirib tashlash</b> uchun ustiga bosing:",
         reply_markup=build_clients_inline_kb(clients),
     )
 
@@ -659,9 +967,14 @@ async def cb_clients_list_back(callback: CallbackQuery) -> None:
         return
 
     clients = get_all_clients()
+    if not clients:
+        await callback.message.edit_text("📭 Hozircha ro'yxatdan o'tgan mijozlar yo'q.")
+        await callback.answer()
+        return
+
     await callback.message.edit_text(
         f"👥 <b>Barcha mijozlar ro'yxati ({len(clients)} ta):</b>\n"
-        "Mijozning to'liq ma'lumotini ko'rish yoki nomini o'zgartirish uchun tanlang:",
+        "Mijozning to'liq ma'lumotini ko'rish, nomini o'zgartirish yoki o'chirish uchun tanlang:",
         reply_markup=build_clients_inline_kb(clients),
     )
     await callback.answer()
@@ -706,6 +1019,70 @@ async def cb_client_view(callback: CallbackQuery) -> None:
         disable_web_page_preview=True,
     )
     await callback.answer()
+
+
+# --- MIJOZNI O'CHIRISH HANDLERLARI ---
+@router.callback_query(F.data.startswith("client_delete_ask:"))
+async def cb_client_delete_ask(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+
+    client_id = int(callback.data.split(":")[1])
+    client = get_client(client_id)
+    if not client:
+        await callback.answer("Mijoz topilmadi!", show_alert=True)
+        return
+
+    confirm_del_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🗑 Ha, butunlay o'chirilsin!",
+                    callback_data=f"client_delete_confirm:{client_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Yo'q, orqaga qaytish",
+                    callback_data=f"client_view:{client_id}",
+                )
+            ],
+        ]
+    )
+
+    await callback.message.edit_text(
+        f"⚠️ <b>DIQQAT!</b>\n\n"
+        f"Siz haqiqatan ham <b>{format_client_display_name(client)}</b> ({client['phone']}) ni "
+        f"mijozlar bazasidan o'chirib tashlamoqchimisiz?",
+        reply_markup=confirm_del_kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("client_delete_confirm:"))
+async def cb_client_delete_confirm(callback: CallbackQuery) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+
+    client_id = int(callback.data.split(":")[1])
+    client = get_client(client_id)
+    client_name = format_client_display_name(client) if client else str(client_id)
+
+    delete_client(client_id)
+    await callback.answer(f"🗑 {client_name} bazadan o'chirildi!", show_alert=True)
+
+    clients = get_all_clients()
+    if not clients:
+        await callback.message.edit_text("📭 Barcha mijozlar o'chirildi. Ro'yxat bo'sh.")
+        return
+
+    await callback.message.edit_text(
+        f"✅ <b>{client_name}</b> bazadan o'chirildi.\n\n"
+        f"👥 <b>Qolgan mijozlar ro'yxati ({len(clients)} ta):</b>",
+        reply_markup=build_clients_inline_kb(clients),
+    )
 
 
 @router.callback_query(F.data.startswith("client_rename:"))
@@ -784,7 +1161,7 @@ async def admin_broadcast_order_request_prompt(message: Message) -> None:
         "🥐 <b>Skazka</b>\n"
         "Assalomu alaykum, hurmatli mijoz!\n"
         "📸 <b>Iltimos, bugungi zakazingizni va foto-otchetni tashlab yuboring!</b>\n\n"
-        "<i>Mahsulotlarimiz turlarini ko'rish uchun «📖 Katalog (Mahsulotlar)» tugmasidan foydalanishingiz mumkin.</i>"
+        "<i>Mahsulotlarimiz turlarini ko'rish va zakaz berish uchun «📖 Katalog (Mahsulotlar)» tugmasidan foydalanishingiz mumkin.</i>"
     )
 
     await message.answer(
@@ -816,8 +1193,7 @@ async def cb_broadcast_foto_otchet_now(callback: CallbackQuery, bot: Bot) -> Non
         "🥐 <b>Skazka</b>\n"
         "Assalomu alaykum, hurmatli hamkor!\n\n"
         "📸 <b>Zakaz tashlab yuboring (foto-otchet)!</b>\n"
-        "Vitrina yoki qoldiq rasmini shu yerga tashlang, rasmga qarab zakazingizni yozib olamiz.\n\n"
-        "📖 <i>Mahsulotlarimiz katalogini ko'rish uchun pastdagi «📖 Katalog (Mahsulotlar)» tugmasini bosing.</i>"
+        "Vitrina yoki qoldiq rasmini shu yerga tashlang, yoki <b>«📖 Katalog (Mahsulotlar)»</b> bo'limiga kirib pishiriqlarni tanlab zakaz bering."
     )
 
     sent_count = 0
@@ -860,7 +1236,7 @@ async def cb_single_client_remind(callback: CallbackQuery, bot: Bot) -> None:
             chat_id=client_id,
             text=(
                 "🥐 <b>Skazka</b>\n"
-                "Assalomu alaykum! 📸 <b>Iltimos, zakaz va foto-otchetni tashlab yuboring!</b>"
+                "Assalomu alaykum! 📸 <b>Iltimos, zakaz va foto-otchetni tashlab yuboring yoki Katalog orqali zakaz bering!</b>"
             ),
             reply_markup=client_main_kb(client_id),
         )
@@ -913,6 +1289,11 @@ async def admin_custom_broadcast_send(
     )
 
 
+# ==============================================================================
+# 8. ADMIN KATALOG BOSHQARUVI (NOM KIRITISH VA O'ZGARTIRISH BILAN)
+# ==============================================================================
+
+
 @router.message(F.text == "➕ Katalogga mahsulot qo'shish")
 async def admin_add_catalog_start(message: Message, state: FSMContext) -> None:
     if not is_admin(message.from_user.id):
@@ -920,7 +1301,7 @@ async def admin_add_catalog_start(message: Message, state: FSMContext) -> None:
 
     await state.set_state(AdminStates.waiting_for_catalog_photo)
     await message.answer(
-        "📸 <b>Yangi mahsulotning (pishiriqning) rasmini yuboring:</b>",
+        "📸 <b>1-qadam: Yangi mahsulotning (pishiriqning) rasmini yuboring:</b>",
         reply_markup=cancel_kb(),
     )
 
@@ -930,20 +1311,10 @@ async def admin_add_catalog_photo(message: Message, state: FSMContext) -> None:
     photo_file_id = message.photo[-1].file_id
     await state.update_data(catalog_photo_id=photo_file_id)
 
-    if message.caption and message.caption.strip():
-        prod_name = message.caption.strip()
-        add_catalog_item(prod_name, photo_file_id)
-        await state.clear()
-        await message.answer(
-            f"✅ <b>«{prod_name}»</b> katalogga muvaffaqiyatli qo'shildi!",
-            reply_markup=admin_main_kb(),
-        )
-        return
-
     await state.set_state(AdminStates.waiting_for_catalog_name)
     await message.answer(
-        "✍️ Endi ushbu mahsulotning <b>nomini</b> (xohlasangiz narxi yoki tavsifi bilan) yozib yuboring:\n"
-        "<i>(Masalan: Napoleon pishirig'i — 45 000 so'm)</i>",
+        "✍️ <b>2-qadam: Endi ushbu pishiriqning nomini (xohlasangiz narxi bilan) yozib yuboring:</b>\n"
+        "<i>(Masalan: Praga torti — 85 000 so'm)</i>",
         reply_markup=cancel_kb(),
     )
 
@@ -963,7 +1334,8 @@ async def admin_add_catalog_name(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     await message.answer(
-        f"✅ <b>«{prod_name}»</b> katalogga muvaffaqiyatli qo'shildi!",
+        f"✅ <b>«{prod_name}»</b> katalogga muvaffaqiyatli qo'shildi!\n"
+        "Mijozlar endi katalog orqali bu mahsulotga zakaz bera oladilar.",
         reply_markup=admin_main_kb(),
     )
 
@@ -982,21 +1354,64 @@ async def admin_manage_catalog(message: Message) -> None:
 
     await message.answer(f"🗂 <b>Katalogdagi mahsulotlar ({len(items)} ta):</b>")
     for item in items:
-        del_kb = InlineKeyboardMarkup(
+        manage_kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text=f"🗑 O'chirish ({item['name'][:20]})",
+                        text="✏️ Nomini o'zgartirish",
+                        callback_data=f"catalog_edit:{item['id']}",
+                    ),
+                    InlineKeyboardButton(
+                        text="🗑 O'chirish",
                         callback_data=f"catalog_del:{item['id']}",
-                    )
+                    ),
                 ]
             ]
         )
         await message.answer_photo(
             photo=item["photo_file_id"],
             caption=f"🥐 <b>{item['name']}</b>\n🕒 Qo'shilgan: {item['created_at']}",
-            reply_markup=del_kb,
+            reply_markup=manage_kb,
         )
+
+
+@router.callback_query(F.data.startswith("catalog_edit:"))
+async def cb_catalog_edit_name_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q", show_alert=True)
+        return
+
+    item_id = int(callback.data.split(":")[1])
+    item = get_catalog_item(item_id)
+    if not item:
+        await callback.answer("Mahsulot topilmadi!", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_for_catalog_rename)
+    await state.update_data(edit_catalog_id=item_id)
+
+    await callback.message.answer(
+        f"✏️ <b>«{item['name']}»</b> uchun yangi nom (va narx) yozib yuboring:",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminStates.waiting_for_catalog_rename, F.text)
+async def admin_save_catalog_new_name(message: Message, state: FSMContext) -> None:
+    if not is_admin(message.from_user.id):
+        return
+
+    new_name = message.text.strip()
+    data = await state.get_data()
+    item_id = data.get("edit_catalog_id")
+    update_catalog_item_name(item_id, new_name)
+    await state.clear()
+
+    await message.answer(
+        f"✅ Mahsulot nomi <b>«{new_name}»</b> ga o'zgartirildi!",
+        reply_markup=admin_main_kb(),
+    )
 
 
 @router.callback_query(F.data.startswith("catalog_del:"))
@@ -1009,6 +1424,11 @@ async def cb_catalog_delete(callback: CallbackQuery) -> None:
     delete_catalog_item(item_id)
     await callback.message.delete()
     await callback.answer("🗑 Mahsulot katalogdan o'chirildi!", show_alert=True)
+
+
+# ==============================================================================
+# 9. FOTO-OTCHET VA ODDIY YOZMA ZAKAZLAR
+# ==============================================================================
 
 
 @router.message(F.photo)
@@ -1137,19 +1557,26 @@ async def handle_client_text_order(
             logging.warning(f"Adminga matn yuborishda xatolik: {e}")
 
     await message.answer(
-        "✅ Xabaringiz adminga yetkazildi! Agar foto-otchet yubormoqchi bo'lsangiz, rasmni shu yerga tashlang.",
+        "✅ Xabaringiz adminga yetkazildi! Agar katalogdan zakaz bermoqchi bo'lsangiz «📖 Katalog (Mahsulotlar)» bo'limiga o'ting.",
         reply_markup=client_main_kb(user_id),
     )
 
 
 # ==============================================================================
-# 6. WEBHOOK VA ASOSIY ISHGA TUSHIRISH (MAIN)
+# 10. WEBHOOK VA ASOSIY ISHGA TUSHIRISH (MAIN)
 # ==============================================================================
 
+
 async def on_startup(bot: Bot) -> None:
-    # Webhookni Telegram serveriga ulash
-    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-    logging.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
+    if WEBHOOK_HOST:
+        await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+        logging.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
+    else:
+        logging.warning("RENDER_EXTERNAL_URL topilmadi!")
+
+
+async def handle_ping(request):
+    return web.Response(text="Skazka Bot is alive and running!")
 
 
 async def main() -> None:
@@ -1159,12 +1586,6 @@ async def main() -> None:
     )
     init_db()
 
-    if BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        logging.error(
-            "DIQQAT! BOT_TOKEN kiritilmagan."
-        )
-        return
-
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -1172,31 +1593,28 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    # Startup hodisasini ulash
     dp.startup.register(on_startup)
 
-    # aiohttp ilovasini yaratish
     app = web.Application()
-    
-    # Webhook so'rovlarini qabul qiluvchi handler
+    app.router.add_get("/", handle_ping)
+
     webhook_requests_handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
     )
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
 
-    # Ilovani sozlash
     setup_application(app, dp, bot=bot)
 
-    # Serverni ishga tushirish
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    
-    logging.info(f"Skazka Webhook Bot port {PORT} da ishga tushdi! Toshkent vaqti: {now_tashkent_str()}")
 
-    # Server to'xtab qolmasligi uchun cheksiz kutish
+    logging.info(
+        f"Skazka Webhook Bot port {PORT} da ishga tushdi! Toshkent vaqti: {now_tashkent_str()}"
+    )
+
     await asyncio.Event().wait()
 
 
